@@ -16,10 +16,17 @@
 package com.github.skydoves.landscapistdemo.ui
 
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.forEachGesture
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
@@ -42,11 +49,21 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -68,6 +85,8 @@ import com.skydoves.landscapist.palette.PalettePlugin
 import com.skydoves.landscapist.palette.rememberPaletteState
 import com.skydoves.landscapist.placeholder.shimmer.Shimmer
 import com.skydoves.landscapist.placeholder.shimmer.ShimmerPlugin
+import kotlinx.coroutines.coroutineScope
+import kotlin.math.abs
 
 @Composable
 fun DisneyPosters(
@@ -128,31 +147,144 @@ private fun PosterItem(
   }
 }
 
+/**
+ * Time period inside which two taps are registered as double tap.
+ */
+private const val DoubleTapTimeoutMs: Long = 500L
+
+/**
+ * Maximum scale that can be applied to the image.
+ */
+private const val MaxZoomScale: Float = 3f
+
+/**
+ * Middle scale value that can be applied to image.
+ */
+private const val MidZoomScale: Float = 2f
+
+/**
+ * Default (min) value that can be applied to image.
+ */
+private const val DefaultZoomScale: Float = 1f
+
+private fun calculateMaxOffset(imageSize: Size, scale: Float, parentSize: Size): Offset {
+  val maxTranslationY = calculateMaxOffsetPerAxis(imageSize.height, scale, parentSize.height)
+  val maxTranslationX = calculateMaxOffsetPerAxis(imageSize.width, scale, parentSize.width)
+  return Offset(maxTranslationX, maxTranslationY)
+}
+
+private fun calculateMaxOffsetPerAxis(axisSize: Float, scale: Float, parentAxisSize: Float): Float {
+  return (axisSize * scale - parentAxisSize).coerceAtLeast(0f) / 2
+}
+
 @Composable
 private fun SelectedPoster(
   poster: Poster,
 ) {
   var palette by rememberPaletteState(null)
 
-  CoilImage(
-    imageModel = { poster.image },
-    modifier = Modifier.aspectRatio(0.8f),
-    component = rememberImageComponent {
-      +ShimmerPlugin(
-        Shimmer.Resonate(
-          baseColor = if (isSystemInDarkTheme()) {
-            background
-          } else {
-            Color.White
-          },
-          highlightColor = Color.LightGray,
-        ),
-      )
-      +CircularRevealPlugin()
-      +PalettePlugin { palette = it }
-    },
-    previewPlaceholder = painterResource(id = R.drawable.poster),
-  )
+  var imageSize by remember { mutableStateOf(Size(0f, 0f)) }
+  var currentScale by remember { mutableStateOf(DefaultZoomScale) }
+  var translation by remember { mutableStateOf(Offset(0f, 0f)) }
+  val scale by animateFloatAsState(targetValue = currentScale, label = "zoomable")
+
+  BoxWithConstraints(
+    modifier = Modifier.fillMaxSize(),
+    contentAlignment = Alignment.Center,
+  ) {
+    val density = LocalDensity.current
+    val parentSize = Size(density.run { maxWidth.toPx() }, density.run { maxHeight.toPx() })
+
+    CoilImage(
+      imageModel = { poster.image },
+      modifier = Modifier
+        .aspectRatio(0.8f)
+        .graphicsLayer(
+          scaleY = scale,
+          scaleX = scale,
+          translationX = translation.x,
+          translationY = translation.y,
+        )
+        .onGloballyPositioned {
+          imageSize = Size(it.size.width.toFloat(), it.size.height.toFloat())
+        }
+        .pointerInput(Unit) {
+          coroutineScope {
+            awaitEachGesture {
+              awaitFirstDown(requireUnconsumed = true)
+              do {
+                val event = awaitPointerEvent(pass = PointerEventPass.Initial)
+
+                val zoom = event.calculateZoom()
+                currentScale = (zoom * currentScale).coerceAtMost(MaxZoomScale)
+
+                val maxTranslation = calculateMaxOffset(
+                  imageSize = imageSize,
+                  scale = currentScale,
+                  parentSize = parentSize,
+                )
+
+                val offset = event.calculatePan()
+                val newTranslationX = translation.x + offset.x * currentScale
+                val newTranslationY = translation.y + offset.y * currentScale
+
+                translation = Offset(
+                  newTranslationX.coerceIn(-maxTranslation.x, maxTranslation.x),
+                  newTranslationY.coerceIn(-maxTranslation.y, maxTranslation.y),
+                )
+
+                if (abs(newTranslationX) < calculateMaxOffsetPerAxis(
+                    imageSize.width,
+                    currentScale,
+                    parentSize.width,
+                  ) || zoom != DefaultZoomScale
+                ) {
+                  event.changes.forEach { it.consume() }
+                }
+              } while (event.changes.any { it.pressed })
+
+              if (currentScale < DefaultZoomScale) {
+                currentScale = DefaultZoomScale
+              }
+            }
+          }
+        }
+        .pointerInput(Unit) {
+          coroutineScope {
+            awaitEachGesture {
+              awaitFirstDown()
+              withTimeoutOrNull(DoubleTapTimeoutMs) {
+                awaitFirstDown()
+                currentScale = when {
+                  currentScale == MaxZoomScale -> DefaultZoomScale
+                  currentScale >= MidZoomScale -> MaxZoomScale
+                  else -> MidZoomScale
+                }
+
+                if (currentScale == DefaultZoomScale) {
+                  translation = Offset(0f, 0f)
+                }
+              }
+            }
+          }
+        },
+      component = rememberImageComponent {
+        +ShimmerPlugin(
+          Shimmer.Resonate(
+            baseColor = if (isSystemInDarkTheme()) {
+              background
+            } else {
+              Color.White
+            },
+            highlightColor = Color.LightGray,
+          ),
+        )
+        +CircularRevealPlugin()
+        +PalettePlugin { palette = it }
+      },
+      previewPlaceholder = painterResource(id = R.drawable.poster),
+    )
+  }
 
   ColorPalettes(palette)
 
